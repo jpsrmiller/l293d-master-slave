@@ -98,11 +98,11 @@ volatile byte bFlag = 0; // lets us know when we're expecting a rising edge on p
 volatile byte reading = 0; //somewhere to store the direct values we read from our interrupt 
 						   // pins before checking to see if we have moved a whole detent
 
-						   // ****************************************************************************
-						   // PinA() - Called by the Interrupt pin when the Rotary Encoder Turned
-						   //    Routine taken from:  
-						   //    https://exploreembedded.com/wiki/Interactive_Menus_for_your_project_with_a_Display_and_an_Encoder
-						   // ****************************************************************************
+// ****************************************************************************
+// PinA() - Called by the Interrupt pin when the Rotary Encoder Turned
+//    Routine taken from:  
+//    https://exploreembedded.com/wiki/Interactive_Menus_for_your_project_with_a_Display_and_an_Encoder
+// ****************************************************************************
 void PinA() {
 
 	if (rotaryDisabled) return;
