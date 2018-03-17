@@ -275,7 +275,7 @@ void testNote(uint8_t slaveAddr, uint8_t channelIndex)
 }
 
 // ****************************************************************************
-// testNote() - energize and de-energize a channel once 
+// playNote() - energize and de-energize a channel once 
 // ****************************************************************************
 void playNote(uint8_t slaveAddr, uint8_t channelIndex)
 {
