@@ -2,8 +2,8 @@
 // L293DBoardSerial.ino - Program for Arduino Slave controlling up to 8 Solenoids
 //                        via the L293D Motor Driver Shield
 //    Author:         John Miller
-//    Revision:       1.0.0
-//    Date:           3/17/2018
+//    Revision:       1.1.0
+//    Date:           8/4/2018
 //    Project Source: https://github.com/jpsrmiller/l293d-master-slave
 // 
 // The program recieves messages from an Arduino Master via serial.
@@ -30,6 +30,15 @@
 //
 // For example, to energize channels 2, 4, and 7 on Slave 1, the Master sends
 //    the command:     <0194>   (94 in Hex = 10010100 in Binary)
+//
+// After channel(s) are energized per a serial command, they are automatically 
+//     de-energized after a pre-configured Channel On Time (default = 80 ms)
+// After a channel is de-energized, a Minimum Channel Off Time (default = 40 ms)
+//     must elapse before the channel can be energized again.
+// Channel On Time and Minimum Channel Off Time can be set via serial messages and
+//     stored in EEPROM.
+//       <FFbb> --> Set Channel On Time to bb/100 seconds
+//       <FEbb> --> Set Minimum Channel Off Time to bb/100 seconds
 //
 // See the project web-site for pictures and more information:
 //            https://buildmusic.net/tutorials/motor-driver/
@@ -64,6 +73,13 @@
 // The remainder of the code should typically not need to be changed
 // *********************************************************************************
 
+
+#include <EEPROM.h>
+
+// Flag to indicate if value(s) for Channel On Time and Minimum Channel Off Time
+// have been previously saved in EEPROM
+#define EEPROM_SET_FLAG	100
+
 // Arduino pins for the shift register
 #define MOTORLATCH   12
 #define MOTORCLK     4
@@ -94,6 +110,12 @@
 #define SERIAL_MSG_END_CHAR			'>'
 #define SERIAL_BAUD_RATE			57600
 
+// Default time in milliseconds that channels should be energized
+#define DEFAULT_CHANNEL_ON_TIME			80
+
+// Default value for minimum time that a channels needs to be off
+// before it can be energized again.
+#define DEFAULT_MIN_CHANNEL_OFF_TIME	40
 
 // Array storing the 8-bit bus after the 74HC595 shift register
 uint8_t motorBus[] = { MOTOR1_A , MOTOR1_B, MOTOR2_A , MOTOR2_B, 
@@ -116,11 +138,18 @@ uint8_t serialMessageAvailable;
 uint8_t testHardwareSolenoidCount;
 uint8_t testHardwarePauseCount;
 
-// Stores last serial communication time and last Channel set time
+// Stores last serial communication time
 // After a time-out period any serial messages in progress are discarded
-//   and any energized channels are de-energized
 unsigned long serialLastTime;
-unsigned long setChannelsLastTime;
+
+// Stores last time each of the individual channels was set
+unsigned long setChannelLastTime[8];
+
+int channelOnTime;      // Time that solenoid is energized (in milliseconds)
+int minChannelOffTime;  // Minimum time (ms) that solenoid must be de-energized before next energizing
+
+uint8_t channelOnBitmask; // Bitmask of channels currently on
+
 
 // ****************************************************************************
 // setup() - Initialization Function
@@ -133,8 +162,12 @@ void setup()
 	serialMessageActive = 0;
 	serialMessageLength = 0;
 	serialMessageAvailable = 0;
+	
+	// Load the Channel On Time and Minimum Channel Off Time from EEPROM
+	loadChannelOnTime();
+	loadMinChannelOffTime();
 
-	// Initialize Test Mode
+	// Initialize Test Mode - Only Used if HARDWARE_TEST=1
 	testHardwareSolenoidCount = 0;
 	testHardwarePauseCount = 0;
 }
@@ -144,15 +177,15 @@ void setup()
 // ****************************************************************************
 void loop()
 {
-	if (HARDWARE_TEST)
-	{
+	if (HARDWARE_TEST) {
 		hardwareTestLoop();
 		return;
 	}
 
-	listenSerial();        // Listen for Serial Message
-	processSerial();       // Process Serial Message and send to next Slave
-	checkResetChannels();  // De-energize channels after time-out
+	listenSerial();         // Listen for Serial Message
+	processSerial();        // Process Serial Message and send to next Slave
+	checkResetChannels();   // Mark channels for De-energize after time-out
+	updateActiveChannels(); // Engergize/De-energize Channel(s)
 }
 
 // ****************************************************************************
@@ -160,15 +193,13 @@ void loop()
 // ****************************************************************************
 void hardwareTestLoop()
 {
-	if (testHardwarePauseCount == 0)
-	{
+	if (testHardwarePauseCount == 0) {
 		// Energize the next solenoid
-		setChannelsActive(1 << testHardwareSolenoidCount);
+		allChannelOutput(1 << testHardwareSolenoidCount);
 	}
-	else
-	{
+	else{
 		// De-energize all channels
-		setChannelsActive(0);
+		allChannelOutput(0);
 	}
 
 	// After the appropriate pause, move to the next solenoid
@@ -249,6 +280,7 @@ void listenSerialNewChar(uint8_t leaveCharsAtEnd)
 // ****************************************************************************
 void processSerial()
 {
+	uint8_t i;
 	uint8_t addr;
 	uint8_t cmd;
 	if (!serialMessageAvailable) return;
@@ -256,11 +288,27 @@ void processSerial()
 	addr = readSerialByte(1);  // Slave Address in the Serial Message
 	cmd = readSerialByte(3);   // Channel bitmask in the Serial Message
 	
+	// Hex Code 0xFF in Address means to set the Channel On Time in 1/100 sec
+	if (addr == 0xFF) setChannelOnTime(cmd);
+
+	// Hex Code 0xFE in Address means to set the Min Channel Off Time in 1/100 sec
+	if (addr == 0xFE) setMinChannelOffTime(cmd);
+
 	// Energize/de-energize channels only if the address in the message
 	// matches the current slave address
 	if (addr == deviceAddress)
 	{
-		setChannelsActive(cmd);
+		for (i = 0; i < 8; i++)
+		{
+			if (bitRead(cmd, i) && !bitRead(channelOnBitmask, i))
+			{
+				if (millis() - setChannelLastTime[i] >= minChannelOffTime)
+				{
+					bitWrite(channelOnBitmask, i, 1);
+					setChannelLastTime[i] = millis();
+				}
+			}
+		}
 	}
 
 	// Transmit the same serial message so that the next Slave can see it
@@ -273,14 +321,58 @@ void processSerial()
 }
 
 // ****************************************************************************
+// setChannelOnTime() - Sets the Channel On Time in 1/100 sec and saves to 
+//     EEPROM 
+// ****************************************************************************
+void setChannelOnTime(uint8_t onTimeCs)
+{
+	EEPROM.write(0, EEPROM_SET_FLAG);
+	EEPROM.write(1, onTimeCs);
+	channelOnTime = onTimeCs * 10; // Stores Channel On Time in milliseconds
+}
+
+// ****************************************************************************
+// setMinChannelOffTime() - Sets the Minimum Channel Off Time in 1/100 sec
+//     and saves to EEPROM 
+// ****************************************************************************
+void setMinChannelOffTime(uint8_t minOffTimeCs)
+{
+	EEPROM.write(2, EEPROM_SET_FLAG);
+	EEPROM.write(3, minOffTimeCs);
+	minChannelOffTime = minOffTimeCs * 10; //Store Min Channel Off Time in ms
+}
+
+// ****************************************************************************
+// loadChannelOnTime() - Loads the Channel On Time from EEPROM or sets to
+//    Default value if EEPROM flag is not set
+// ****************************************************************************
+void loadChannelOnTime()
+{
+	if (EEPROM.read(0) == EEPROM_SET_FLAG)
+		channelOnTime = EEPROM.read(1) * 10;
+	else
+		channelOnTime = DEFAULT_CHANNEL_ON_TIME;
+}
+
+// ****************************************************************************
+// loadMinChannelOfftime() - Loads the Minimum Channel Off Time from EEPROM
+//    or sets to Default value if EEPROM flag is not set
+// ****************************************************************************
+void loadMinChannelOffTime()
+{
+	if (EEPROM.read(2) == EEPROM_SET_FLAG)
+		minChannelOffTime = EEPROM.read(3) * 10;
+	else
+		minChannelOffTime = DEFAULT_MIN_CHANNEL_OFF_TIME;
+}
+
+// ****************************************************************************
 // readSerialByte() - Reads a byte from Hexadecimal text in the Serial Message
 //                    starting at the position 'index'
 // ****************************************************************************
 uint8_t readSerialByte(uint8_t index)
 {
-	uint8_t n1;
-	uint8_t n2;
-	uint8_t b;
+	uint8_t n1, n2, b;
 
 	n1 = charToNib(serialData[index]);
 	n2 = charToNib(serialData[index+1]);
@@ -301,25 +393,31 @@ uint8_t charToNib(uint8_t ch)
 }
 
 // ****************************************************************************
-// checkResetChannels() - If more than 1 second has elapsed since the last
-//          command to energize or de-energize channels, then de-energize
-//          all channels.  This is done so that the program will not be in a
-//          state where solenoids are energized for a long time (possibly 
-//          causing damage or overheating)
+// checkResetChannels() - Check each channel to see if it has been energized
+//     longer than 'channelOnTime'.  If so, then de-energize that channel.
 // ****************************************************************************
 uint8_t checkResetChannels()
 {
-	if (millis() < setChannelsLastTime + 1000) return;
-	setChannelsActive(0);  // De-energize all channels
+	uint8_t i;
+	for (i = 0; i < 8; i++)
+	{
+		if (bitRead(channelOnBitmask, i))
+		{
+			if (millis() - setChannelLastTime[i] > channelOnTime)
+			{
+				bitWrite(channelOnBitmask, i, 0);
+				setChannelLastTime[i] = millis();
+			}
+		}
+	}
 }
 
 // ****************************************************************************
-// setChannelsActive() - Energizes channels per the 8-bit 'channelBitmask'
+// updateActiveChannels() - Energize or De-energize channels per bitmask
 // ****************************************************************************
-uint8_t setChannelsActive(uint8_t channelBitmask)
+void updateActiveChannels()
 {
-	setChannelsLastTime = millis();
-	allChannelOutput(channelBitmask);
+	allChannelOutput(channelOnBitmask);
 }
 
 // ****************************************************************************
@@ -403,6 +501,5 @@ void shiftWriteAll(int outputBitmask)
 	delayMicroseconds(5);    // For safety, not really needed.
 	digitalWrite(MOTORLATCH, LOW);
 }
-
 
 
